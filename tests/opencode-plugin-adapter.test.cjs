@@ -610,3 +610,179 @@ test('#2697: context-monitor skipped for Write when context_warnings disabled (n
     `context-monitor spawn must be skipped for Write when context_warnings:false; spawn argvs: ${JSON.stringify(spawns)}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// OpenCode v2 setup (issue #4916) — the v2 loader schema-decodes the default
+// export as `{ id, setup | effect }`, and setup must return cleanup (or void).
+// A v1 hooks object returned from setup would be silently ignored, so v2
+// registers the same guard lattice through the context domains instead.
+// ---------------------------------------------------------------------------
+
+test('v2 export shape: id + setup readable, v1 loader walk still yields one server (#4916)', () => {
+  const mod = require(ADAPTER_SRC);
+  assert.equal(mod.id, 'gsd-core');
+  assert.equal(typeof mod.setup, 'function');
+  assert.equal(typeof mod.server, 'function');
+  // Both `id` and `setup` are non-enumerable: the v1 Object.values walk sees
+  // exactly [server] while v2 reads them via property access.
+  const values = Object.values(mod);
+  assert.equal(values.length, 1);
+  assert.equal(typeof values[0], 'function');
+});
+
+test('resolveNodeBin: real node binary, never the host binary (#4916)', () => {
+  const bin = _internals.resolveNodeBin();
+  assert.ok(typeof bin === 'string' && bin.length > 0, 'expected a node binary path');
+  assert.ok(!/opencode/i.test(bin), `must not resolve to the host binary: ${bin}`);
+  assert.ok(fs.statSync(bin).isFile());
+});
+
+test('resolveNodeBin: GSD_NODE_BIN override wins without probing (#4916)', () => {
+  const cp = require('node:child_process');
+  const script =
+    `const m = require(${JSON.stringify(ADAPTER_SRC)});` +
+    'process.stdout.write(String(m.server._internals.resolveNodeBin()));';
+  const out = cp.execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, GSD_NODE_BIN: '/custom/node' },
+    encoding: 'utf8',
+  });
+  assert.equal(out, '/custom/node');
+});
+
+test('mapToolNameV2: v2 tool ids map onto the Claude lattice (#4916)', () => {
+  const map = _internals.mapToolNameV2;
+  assert.equal(map('shell'), 'Bash');
+  assert.equal(map('glob'), 'Grep');
+  assert.equal(map('patch'), 'MultiEdit');
+  assert.equal(map('READ'), 'Read');
+  assert.equal(map('read'), 'Read');
+});
+
+test('extractV2ToolInput: tolerates v2 key names and mirrors file_path/path (#4916)', () => {
+  const { toolInput } = _internals.extractV2ToolInput({ file: '/w/a.md' });
+  assert.equal(toolInput.file_path, '/w/a.md');
+  assert.equal(toolInput.path, '/w/a.md');
+  const uri = _internals.extractV2ToolInput({ uri: 'file:///w/b.md' }).toolInput;
+  assert.equal(uri.file_path, '/w/b.md');
+  const cmd = _internals.extractV2ToolInput({ cmd: 'ls' }).toolInput;
+  assert.equal(cmd.command, 'ls');
+  const grep = _internals.extractV2ToolInput({ pattern: '*.env' }).toolInput;
+  assert.equal(grep.glob, '*.env');
+});
+
+test('collectResultTextSlots: covers every v2 result text shape (#4916)', () => {
+  const slotsOf = _internals.collectResultTextSlots;
+  assert.equal(slotsOf(null).length, 0);
+  const s1 = { output: 'hello' };
+  assert.equal(slotsOf(s1).length, 1);
+  slotsOf(s1)[0].set('bye');
+  assert.equal(s1.output, 'bye');
+  const s2 = { output: { content: 'hi' } };
+  slotsOf(s2)[0].set('yo');
+  assert.equal(s2.output.content, 'yo');
+  const s3 = { content: 'plain' };
+  slotsOf(s3)[0].set('edited');
+  assert.equal(s3.content, 'edited');
+  const s4 = { content: [{ type: 'text', text: 'a' }, { type: 'file', uri: 'u', mime: 'm' }] };
+  assert.equal(slotsOf(s4).length, 1);
+  slotsOf(s4)[0].set('b');
+  assert.equal(s4.content[0].text, 'b');
+});
+
+test('normalizeV2Event: v2 {type,data} and legacy {event:{type,properties}} (#4916)', () => {
+  const norm = _internals.normalizeV2Event;
+  assert.deepEqual(norm({ type: 'session.created', data: { sessionID: 's' } }), {
+    type: 'session.created',
+    data: { sessionID: 's' },
+  });
+  assert.deepEqual(norm({ event: { type: 'session.idle', properties: { a: 1 } } }), {
+    type: 'session.idle',
+    data: { a: 1 },
+  });
+  assert.equal(norm(null), null);
+  assert.equal(norm({}), null);
+});
+
+test('isInsideDir: contained, exact root, and escape attempts (#4916)', () => {
+  const inside = _internals.isInsideDir;
+  assert.equal(inside('/w', '/w/a.md'), true);
+  assert.equal(inside('/w', '/w'), true);
+  assert.equal(inside('/w', '/w/../w/a.md'), true);
+  assert.equal(inside('/w', '/etc/passwd'), false);
+  assert.equal(inside('/w', '/w/../etc/passwd'), false);
+});
+
+test('gsdV2Setup: registers v2 hooks and enforces the secret-read guard end to end (#4916)', async (t) => {
+  const projectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-v2-setup-')));
+  t.after(() => cleanup(projectDir));
+  fs.mkdirSync(path.join(projectDir, '.planning'), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, '.planning', 'config.json'), '{}');
+
+  const regs = {};
+  const forDomain = (domain) => ({
+    hook: async (name, fn) => {
+      regs[`${domain}.${name}`] = fn;
+      return { dispose: async () => {} };
+    },
+  });
+  const ctx = {
+    location: { directory: projectDir },
+    shell: forDomain('shell'),
+    tool: forDomain('tool'),
+    session: forDomain('session'),
+    permission: forDomain('permission'),
+    event: {
+      subscribe: async function* () {
+        yield { type: 'session.created', data: { sessionID: 'ses-v2-test', directory: projectDir } };
+      },
+    },
+  };
+
+  const dispose = await require(ADAPTER_SRC).setup(ctx);
+  t.after(async () => { await dispose(); });
+  for (const k of [
+    'shell.create.before',
+    'tool.execute.before',
+    'tool.execute.after',
+    'session.compaction',
+    'permission.evaluate',
+  ]) {
+    assert.equal(typeof regs[k], 'function', `missing registration: ${k}`);
+  }
+
+  // Secret read blocked through the real node + hook script bridge.
+  await assert.rejects(
+    regs['tool.execute.before']({ tool: 'read', input: { filePath: path.join(projectDir, '.env') } }),
+    /secret/i,
+  );
+  // Benign read passes.
+  await regs['tool.execute.before']({ tool: 'read', input: { filePath: path.join(projectDir, 'notes.txt') } });
+
+  // Shell env injection.
+  const env = {};
+  await regs['shell.create.before']({ env });
+  assert.ok(String(env.GSD_DIR || '').endsWith('gsd-core'));
+
+  // Permission backstop: write-like external denied; shell/read fail open.
+  const deny = {
+    action: 'external_directory',
+    metadata: { tool: 'write' },
+    resources: ['/tmp/elsewhere.md'],
+    effect: 'allow',
+  };
+  await regs['permission.evaluate'](deny);
+  assert.equal(deny.effect, 'deny');
+  const allowShell = {
+    action: 'external_directory',
+    metadata: { tool: 'shell' },
+    resources: ['/tmp/elsewhere'],
+    effect: 'allow',
+  };
+  await regs['permission.evaluate'](allowShell);
+  assert.equal(allowShell.effect, 'allow');
+
+  // Compaction breadcrumb.
+  const compaction = { system: [] };
+  await regs['session.compaction'](compaction);
+  assert.equal(compaction.system.length, 1);
+});
