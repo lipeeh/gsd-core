@@ -267,7 +267,7 @@ function runHook(hookFile, payload, opts = {}) {
     if (!_nodeBinWarned) {
       _nodeBinWarned = true;
       console.error(
-        "[gsd-core] no node runtime found (checked GSD_NODE_BIN, PATH, fnm, " +
+        "[gsd-core] no node runtime found (checked GSD_NODE_BIN, absolute PATH entries, fnm, " +
           "homebrew) — GSD guards are NOT enforced until node is available.",
       );
     }
@@ -855,17 +855,20 @@ const GsdCorePlugin = async ({ directory } = {}) => {
 //   tool "execute.before"  ← v1 "tool.execute.before" (throw = block)
 //   tool "execute.after"   ← v1 "tool.execute.after" (result rewrite + scan)
 //   session "compaction"    ← v1 "experimental.session.compacting"
-//   permission "evaluate"  ← deny-backstop for external-directory writes
-//   event.subscribe        ← v1 "event" (session.created tracking; the v2 bus
-//                            is server-global with payloads under event.data,
-//                            and has no file.edited — the config reload is
-//                            bridged with fs.watch instead)
-// The v1 `server` entry below is untouched for old hosts. In file-copy installs
-// (IS_PACKAGE_TREE false) there is no command/agent/skill registration to port
-// — GSD's native file copy already owns that surface.
+//   permission "evaluate"  ← write-only backstop keyed on tool id (M4)
+//   event.subscribe        ← v1 "event" (session.created tracking filtered by
+//                            ctx.location.directory + SessionStart hooks; the
+//                            v2 bus is server-global with payloads under
+//                            event.data, and has no file.edited — the config
+//                            reload is bridged with fs.watch instead)
+//   command/agent/skill    ← v2 transforms in package-tree mode only (M3);
+//                            skipped on file-copy installs where GSD's native
+//                            file copy already owns that surface.
+// The v1 `server` entry below is untouched for old hosts.
 
 let _nodeBin; // undefined = unresolved; string = binary; null = none found
 let _nodeBinWarned = false;
+let _nodeBinEnvKey; // GSD_NODE_BIN value observed at resolve time (cache guard)
 
 function isExecutableFile(p) {
   try {
@@ -879,47 +882,89 @@ function isExecutableFile(p) {
 // Under a Bun-compiled host (OpenCode v2 server) process.execPath is the
 // opencode binary itself — spawning it with a hook path runs the CLI, not the
 // guard, and every guard dies silently. Resolve a real node first;
-// GSD_NODE_BIN wins when set.
+// GSD_NODE_BIN wins when set and valid.
 //
 // Deliberately probe-free (no `--version` spawn): the resolver must stay a
 // pure filesystem lookup so stubbed-spawn test harnesses keep working.
-function resolveNodeBin() {
-  if (_nodeBin !== undefined) return _nodeBin;
-  // Explicit override wins without probing (operator-configured).
-  if (process.env.GSD_NODE_BIN) {
-    _nodeBin = process.env.GSD_NODE_BIN;
-    return _nodeBin;
-  }
-  const execBase = path.basename(process.execPath || "");
-  if (/^node(\.exe)?$/i.test(execBase)) {
-    _nodeBin = process.execPath;
-    return _nodeBin;
+//
+// Windows: also probe `node.exe` (+ PATHEXT entries), skip relative PATH
+// entries, and validate GSD_NODE_BIN instead of trusting it blindly.
+function _resetNodeBinCache() {
+  _nodeBin = undefined;
+  _nodeBinEnvKey = undefined;
+  _nodeBinWarned = false;
+}
+
+function _nodeCandidates() {
+  const isWin = process.platform === "win32";
+  const names = isWin ? ["node.exe", "node"] : ["node"];
+  if (isWin && process.env.PATHEXT) {
+    for (const ext of String(process.env.PATHEXT).split(";")) {
+      const e = ext.trim().toLowerCase();
+      if (e && e !== ".exe" && !names.includes(`node${e}`)) names.push(`node${e}`);
+    }
   }
   const candidates = [];
   for (const dir of String(process.env.PATH || "").split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, "node"));
+    if (!dir || !path.isAbsolute(dir)) continue; // ignore relative PATH entries
+    for (const n of names) candidates.push(path.join(dir, n));
   }
-  candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node");
+  const brew = isWin ? [] : ["/opt/homebrew/bin/node", "/usr/local/bin/node"];
+  candidates.push(...brew);
   try {
     const store = path.join(os.homedir(), ".local", "share", "fnm", "node-versions");
     if (fs.existsSync(store)) {
       for (const v of fs.readdirSync(store).sort().reverse()) {
-        candidates.push(path.join(store, v, "installation", "bin", "node"));
+        for (const n of names) {
+          candidates.push(path.join(store, v, "installation", "bin", n));
+        }
       }
     }
   } catch {
     // fnm store unreadable — the PATH candidates cover the common case.
   }
+  return candidates;
+}
+
+function resolveNodeBin() {
+  if (_nodeBin !== undefined && _nodeBinEnvKey === process.env.GSD_NODE_BIN) {
+    return _nodeBin;
+  }
+  // Explicit override wins when it points at an executable file
+  // (operator-configured). An invalid override falls through to probing so a
+  // typo never becomes the spawn binary.
+  const override = (process.env.GSD_NODE_BIN || "").trim();
+  if (override) {
+    if (isExecutableFile(override)) {
+      _nodeBin = override;
+      _nodeBinEnvKey = process.env.GSD_NODE_BIN;
+      return _nodeBin;
+    }
+    if (!_nodeBinWarned) {
+      _nodeBinWarned = true;
+      console.error(
+        `[gsd-core] GSD_NODE_BIN=${override} is not executable — ignoring it and probing PATH.`,
+      );
+    }
+  }
+  const execBase = path.basename(process.execPath || "");
+  if (/^node(\.exe)?$/i.test(execBase) && isExecutableFile(process.execPath)) {
+    _nodeBin = process.execPath;
+    _nodeBinEnvKey = process.env.GSD_NODE_BIN;
+    return _nodeBin;
+  }
   const seen = new Set();
-  for (const bin of candidates) {
+  for (const bin of _nodeCandidates()) {
     if (seen.has(bin)) continue;
     seen.add(bin);
     if (isExecutableFile(bin)) {
       _nodeBin = bin;
+      _nodeBinEnvKey = process.env.GSD_NODE_BIN;
       return bin;
     }
   }
   _nodeBin = null;
+  _nodeBinEnvKey = process.env.GSD_NODE_BIN;
   return null;
 }
 
@@ -987,6 +1032,36 @@ function rewriteReadPathV2(p) {
     .replace(/(?:.*)\/\.claude\/gsd-core\//, GSD_CORE + "/");
 }
 
+// v2 has no `output.metadata` slot on execute.before — handleHookResult without
+// a carrier would still console.error advisories but never reach the model.
+// Run the hook, rethrow blocks, and best-effort attach advisories onto the
+// live v2 event (event.metadata / event.output.metadata) so nothing is
+// silently dropped (m1).
+function v2HandleHook(hookFile, payload, event) {
+  const r = runHook(hookFile, payload);
+  const carrier = { metadata: {} };
+  handleHookResult(r, carrier);
+  const list = carrier.metadata && carrier.metadata._gsdAdvisory;
+  if (list && list.length && event && typeof event === "object") {
+    try {
+      event.metadata = event.metadata || {};
+      const cur = Array.isArray(event.metadata._gsdAdvisory)
+        ? event.metadata._gsdAdvisory
+        : [];
+      event.metadata._gsdAdvisory = cur.concat(list);
+      if (event.output && typeof event.output === "object") {
+        event.output.metadata = event.output.metadata || {};
+        const ocur = Array.isArray(event.output.metadata._gsdAdvisory)
+          ? event.output.metadata._gsdAdvisory
+          : [];
+        event.output.metadata._gsdAdvisory = ocur.concat(list);
+      }
+    } catch {
+      // Advisory surfacing is best-effort — the guard itself already ran.
+    }
+  }
+}
+
 async function v2ExecuteBefore(event) {
   const claudeTool = mapToolNameV2(event.tool);
   const { raw, toolInput } = extractV2ToolInput(event.input);
@@ -1019,34 +1094,33 @@ async function v2ExecuteBefore(event) {
 
   // NOTE: session_id intentionally omitted (gsd-read-guard.js treats a
   // non-empty session_id as a Claude Code session and skips its advisory).
-  // No metadata slot exists on v2 execute.before — advisories surface via
-  // console.error only; a throw is honored as a block.
+  // Blocks throw; advisories are best-effort attached onto the live event by
+  // v2HandleHook (m1) since v2 execute.before has no output.metadata slot.
   if (claudeTool === "Write" || claudeTool === "Edit") {
-    handleHookResult(runHook("gsd-prompt-guard.js", prePayload()));
-    handleHookResult(runHook("gsd-read-guard.js", prePayload()));
+    v2HandleHook("gsd-prompt-guard.js", prePayload(), event);
+    v2HandleHook("gsd-read-guard.js", prePayload(), event);
   }
 
   if (isWriteLike) {
     for (const t of targets.length ? targets : [undefined]) {
-      handleHookResult(
-        runHook(
-          "gsd-worktree-path-guard.js",
-          t ? prePayload({ tool_input: { ...toolInput, file_path: t, path: t } }) : prePayload(),
-        ),
+      v2HandleHook(
+        "gsd-worktree-path-guard.js",
+        t ? prePayload({ tool_input: { ...toolInput, file_path: t, path: t } }) : prePayload(),
+        event,
       );
     }
   }
 
   if (claudeTool === "Write") {
-    handleHookResult(runHook("gsd-write-guard.js", prePayload()));
+    v2HandleHook("gsd-write-guard.js", prePayload(), event);
   }
 
   if (isWriteLike || claudeTool === "Bash") {
-    handleHookResult(runHook("gsd-workflow-guard.js", prePayload()));
+    v2HandleHook("gsd-workflow-guard.js", prePayload(), event);
   }
 
   if (["Read", "Grep", "Bash"].includes(claudeTool)) {
-    handleHookResult(runHook("gsd-secret-read-guard.js", prePayload()));
+    v2HandleHook("gsd-secret-read-guard.js", prePayload(), event);
   }
 }
 
@@ -1087,14 +1161,16 @@ async function v2ExecuteAfter(event) {
     if (claudeTool === "Read" || claudeTool === "WebFetch" || claudeTool === "WebSearch") {
       const response = text || (event.result && event.result.output != null ? JSON.stringify(event.result.output) : "");
       if (response) {
-        handleHookResult(
-          runHook("gsd-read-injection-scanner.js", {
+        v2HandleHook(
+          "gsd-read-injection-scanner.js",
+          {
             hook_event_name: "PostToolUse",
             tool_name: claudeTool,
             tool_input: toolInput,
             tool_response: response,
             cwd,
-          }),
+          },
+          event,
         );
       }
       return;
@@ -1102,14 +1178,16 @@ async function v2ExecuteAfter(event) {
   }
 
   if (currentSessionId && !contextWarningsDisabled(cwd)) {
-    handleHookResult(
-      runHook("gsd-context-monitor.js", {
+    v2HandleHook(
+      "gsd-context-monitor.js",
+      {
         hook_event_name: "PostToolUse",
         tool_name: claudeTool,
         tool_input: toolInput,
         session_id: currentSessionId,
         cwd,
-      }),
+      },
+      event,
     );
   }
 }
@@ -1149,19 +1227,22 @@ function isInsideDir(root, p) {
 
 async function v2PermissionEvaluate(e) {
   // Backstop for writes outside the worktree issued through paths that skip
-  // the tool hooks (e.g. nested Code Mode calls). Write-like only: reads and
-  // shell invocations fail open (v1 parity — the v1 lattice never gated those
-  // by path), so legitimate out-of-tree workflows keep working.
-  if (!e || !/external/i.test(String(e.action || ""))) return;
-  let haystack = String(e.action || "");
-  try {
-    if (e.metadata) haystack += " " + JSON.stringify(e.metadata);
-    if (e.source) haystack += " " + JSON.stringify(e.source);
-  } catch {
-    // Unserializable metadata — fall through to the fail-open path below.
-  }
-  if (!/write|edit|patch|apply|create|mkdir|move|copy|delete|remove|trash|rename/i.test(haystack)) return;
-  const resources = Array.isArray(e.resources) ? e.resources : [];
+  // the tool hooks (e.g. nested Code Mode calls). Keyed on the TOOL id — never
+  // on keyword regex over metadata JSON (M4): reads/shell fail open (v1
+  // parity — the v1 lattice never gated those by path), so legitimate
+  // out-of-tree workflows keep working.
+  if (!e || typeof e !== "object") return;
+  const tool = String(
+    e.tool ?? e.tool_name ?? e.metadata?.tool ?? e.metadata?.tool_name ?? e.source?.tool ?? "",
+  );
+  if (!/^(write|edit|multiedit|apply_patch|patch)$/i.test(tool)) return;
+  const resources = Array.isArray(e.resources)
+    ? e.resources
+    : Array.isArray(e.paths)
+      ? e.paths
+      : Array.isArray(e.files)
+        ? e.files
+        : [];
   const outside = resources.filter((r) => typeof r === "string" && r && !isInsideDir(currentCwd, r));
   if (!outside.length) return;
   e.effect = "deny";
@@ -1176,19 +1257,70 @@ function normalizeV2Event(input) {
   return { type, data: data && typeof data === "object" ? data : {} };
 }
 
-async function v2EventLoop(ctx, signal) {
+// The v2 event bus is server-global: without filtering, any other project's
+// session.created/moved/updated would overwrite currentSessionId/currentCwd
+// (M1). Only accept events whose directory resolves to this plugin instance's
+// home directory.
+function isSameProjectDir(homeDir, dir) {
+  try {
+    if (typeof homeDir !== "string" || !homeDir) return true; // unscoped — accept
+    if (typeof dir !== "string" || !dir) return false;
+    return path.resolve(dir) === path.resolve(homeDir);
+  } catch {
+    return false;
+  }
+}
+
+function v2SessionStartHooks() {
+  // v1 parity (M2): gsd-ensure-canonical-path.js + gsd-check-update.js run on
+  // every session.created. Silent by design (no handleHookResult).
+  runHook("gsd-ensure-canonical-path.js", {
+    hook_event_name: "SessionStart",
+    session_id: currentSessionId,
+    cwd: currentCwd,
+  });
+  runHook("gsd-check-update.js", {
+    hook_event_name: "SessionStart",
+    session_id: currentSessionId,
+    cwd: currentCwd,
+  });
+}
+
+async function v2EventLoop(ctx, signal, opts = {}) {
+  const homeDir =
+    (opts && typeof opts.homeDir === "string" && opts.homeDir) ||
+    (ctx && ctx.location && typeof ctx.location.directory === "string"
+      ? ctx.location.directory
+      : currentCwd);
+  const onDirectoryChange =
+    opts && typeof opts.onDirectoryChange === "function" ? opts.onDirectoryChange : null;
   for await (const input of ctx.event.subscribe({ signal })) {
     if (signal && signal.aborted) break;
     const norm = normalizeV2Event(input);
     if (!norm) continue;
     if (norm.type === "session.created") {
+      const dir = norm.data.directory ?? norm.data.info?.directory;
+      if (!isSameProjectDir(homeDir, dir)) continue;
       const sid = norm.data.sessionID ?? norm.data.info?.id;
       if (sid) currentSessionId = sid;
-      const dir = norm.data.directory ?? norm.data.info?.directory;
-      if (typeof dir === "string" && dir) currentCwd = dir;
+      if (typeof dir === "string" && dir) {
+        const prev = currentCwd;
+        currentCwd = dir;
+        if (prev !== dir && onDirectoryChange) {
+          try { onDirectoryChange(dir); } catch {}
+        }
+      }
+      v2SessionStartHooks();
     } else if (norm.type === "session.moved" || norm.type === "session.updated") {
       const dir = norm.data.directory ?? norm.data.to ?? norm.data.location?.directory;
-      if (typeof dir === "string" && dir) currentCwd = dir;
+      if (!isSameProjectDir(homeDir, dir)) continue;
+      if (typeof dir === "string" && dir) {
+        const prev = currentCwd;
+        currentCwd = dir;
+        if (prev !== dir && onDirectoryChange) {
+          try { onDirectoryChange(dir); } catch {}
+        }
+      }
     }
     // session.idle / session.error / permission.*: recognized no-ops, mirroring
     // the v1 sentinels — GSD state already lives in .planning/.
@@ -1196,19 +1328,24 @@ async function v2EventLoop(ctx, signal) {
 }
 
 // The v2 event bus has no file.edited — bridge the .planning/config.json
-// reload with fs.watch (debounced). Returns an unwatch function or null.
-function watchConfigReloadV2(cwd) {
-  const file = path.join(cwd, ".planning", "config.json");
+// reload with fs.watch (debounced). Watches the .planning DIRECTORY (not the
+// file inode) so atomic-rename writes don't lose the watch (m2); the payload
+// cwd resolves dynamically so later cwd changes are honored. Returns an
+// unwatch function or null.
+function watchConfigReloadV2(cwdOrGetter) {
+  const getCwd =
+    typeof cwdOrGetter === "function" ? cwdOrGetter : () => cwdOrGetter;
   let timer = null;
   const fire = () => {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
+      const cwd = getCwd();
       try {
         handleHookResult(
           runHook("gsd-config-reload.js", {
             hook_event_name: "FileChanged",
-            file_path: file,
+            file_path: path.join(cwd, ".planning", "config.json"),
             event: "change",
             cwd,
           }),
@@ -1220,29 +1357,133 @@ function watchConfigReloadV2(cwd) {
     if (timer.unref) timer.unref();
   };
   const watchers = [];
-  try {
-    watchers.push(fs.watch(file, fire));
-  } catch {
+  const watchDir = (dir) => {
     try {
-      const w = fs.watch(path.dirname(file), (ev, name) => {
-        if (name === "config.json") fire();
+      const w = fs.watch(dir, (ev, name) => {
+        if (!name || name === "config.json") fire();
+      });
+      watchers.push(w);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const initial = getCwd();
+  const planningDir = path.join(initial, ".planning");
+  if (!watchDir(planningDir)) {
+    // .planning not present yet — watch the project root for its creation.
+    try {
+      const w = fs.watch(initial, (ev, name) => {
+        if (name === ".planning" || name === "config.json") {
+          if (fs.existsSync(planningDir) && !watchers.some((x) => x._gsdDir === planningDir)) {
+            watchDir(planningDir);
+          }
+          fire();
+        }
       });
       watchers.push(w);
     } catch {
-      return null; // .planning not present — nothing to watch.
+      return null; // nothing watchable — no config reload bridging.
     }
   }
-  return () => {
+  const unwatch = () => {
     for (const w of watchers) {
       try { w.close(); } catch {}
     }
+    watchers.length = 0;
   };
+  return unwatch;
+}
+
+// Package-tree command/agent/skill entries shared by the v1 config hook and
+// the v2 transform registration below (M3). Null outside the package tree so
+// file-copy installs never double-register (native file copy owns it there).
+function buildV2PackageTreeEntries() {
+  if (!IS_PACKAGE_TREE) return null;
+  const commands = loadDir(
+    COMMANDS,
+    (f) => "gsd-" + f.slice(0, -3),
+    (body, fm, name) => ({
+      template: rewriteRefs(body.trim()),
+      description: fm.description || `GSD ${name.slice(0, -3)} command`,
+    }),
+  );
+  const agents = loadDir(
+    AGENTS,
+    (f) => f.slice(0, -3),
+    (body, fm, name) => ({
+      prompt: rewriteRefs(body.trim()),
+      description: fm.description || `GSD ${name.slice(0, -3)} agent`,
+      mode: fm.mode || "subagent",
+    }),
+  );
+  let skillsPath = null;
+  try {
+    skillsPath = prepareSkillsCache() || SKILLS;
+  } catch {
+    skillsPath = SKILLS;
+  }
+  return { commands, agents, skillsPath };
+}
+
+// v2 package-tree registration via ctx.command/agent/skill.transform (M3).
+// Tries `transform` first, then `register`, across a few call shapes — the v2
+// host API is still settling, so every attempt is guarded. Returns true when
+// at least one domain registered.
+async function registerV2PackageTree(ctx) {
+  const entries = buildV2PackageTreeEntries();
+  if (!entries) return false;
+  let did = false;
+  const tryDomain = async (api, kind, apply) => {
+    if (!api || typeof api !== "object") return;
+    try {
+      if (typeof api.transform === "function") {
+        await api.transform(apply.transformArg);
+        did = true;
+      } else if (typeof api.register === "function") {
+        await apply.register(api);
+        did = true;
+      } else if (typeof api.hook === "function" && kind === "config") {
+        await api.hook("config", apply.transformArg);
+        did = true;
+      }
+    } catch (err) {
+      console.error(`[gsd-core] v2 package-tree ${kind} registration failed: ${err && err.message}`);
+    }
+  };
+  await tryDomain(ctx && ctx.command, "command", {
+    transformArg: (cfg) => ({ ...(cfg || {}), ...entries.commands }),
+    register: async (api) => {
+      for (const [k, v] of Object.entries(entries.commands)) await api.register(k, v);
+    },
+  });
+  await tryDomain(ctx && ctx.agent, "agent", {
+    transformArg: (cfg) => ({ ...(cfg || {}), ...entries.agents }),
+    register: async (api) => {
+      for (const [k, v] of Object.entries(entries.agents)) await api.register(k, v);
+    },
+  });
+  await tryDomain(ctx && ctx.skill, "skill", {
+    transformArg: (cfg) => {
+      const c = cfg && typeof cfg === "object" ? { ...cfg } : {};
+      c.paths = Array.isArray(c.paths) ? [...c.paths] : [];
+      if (entries.skillsPath && !c.paths.includes(entries.skillsPath)) {
+        c.paths.push(entries.skillsPath);
+      }
+      return c;
+    },
+    register: async (api) => {
+      await api.register(entries.skillsPath);
+    },
+  });
+  return did;
 }
 
 async function gsdV2Setup(ctx) {
   if (ctx && ctx.location && typeof ctx.location.directory === "string" && ctx.location.directory) {
     currentCwd = ctx.location.directory;
   }
+  const homeDir = currentCwd;
   const registrations = [];
   const register = async (domain, name, fn) => {
     try {
@@ -1259,16 +1500,34 @@ async function gsdV2Setup(ctx) {
   await register("session", "compaction", v2Compaction);
   await register("permission", "evaluate", v2PermissionEvaluate);
 
+  // Package-tree mode: register commands/agents/skills via v2 transforms
+  // (M3). Skipped on file-copy installs (IS_PACKAGE_TREE false) where GSD's
+  // native file copy already owns that surface — no double-registration.
+  try {
+    await registerV2PackageTree(ctx);
+  } catch (err) {
+    console.error(`[gsd-core] v2 package-tree registration failed: ${err && err.message}`);
+  }
+
   const controller = new AbortController();
   let consume = null;
+  let unwatch = watchConfigReloadV2(() => currentCwd);
+  const rearmWatch = () => {
+    try {
+      if (typeof unwatch === "function") unwatch();
+    } catch {}
+    unwatch = watchConfigReloadV2(() => currentCwd);
+  };
   try {
     if (ctx && ctx.event && typeof ctx.event.subscribe === "function") {
-      consume = v2EventLoop(ctx, controller.signal).catch(() => {});
+      consume = v2EventLoop(ctx, controller.signal, {
+        homeDir,
+        onDirectoryChange: rearmWatch,
+      }).catch(() => {});
     }
   } catch {
     consume = null;
   }
-  const unwatch = watchConfigReloadV2(currentCwd);
 
   return async () => {
     try { controller.abort(); } catch {}
@@ -1311,12 +1570,22 @@ GsdCorePlugin._internals = {
   GsdCorePlugin,
   gsdV2Setup,
   resolveNodeBin,
+  _resetNodeBinCache,
   mapToolNameV2,
   extractV2ToolInput,
   v2FileTargets,
   collectResultTextSlots,
   normalizeV2Event,
   isInsideDir,
+  isSameProjectDir,
+  v2EventLoop,
+  v2ExecuteBefore,
+  v2ExecuteAfter,
+  v2PermissionEvaluate,
+  v2HandleHook,
+  watchConfigReloadV2,
+  buildV2PackageTreeEntries,
+  registerV2PackageTree,
 };
 
 const gsdCorePluginExport = { server: GsdCorePlugin };
